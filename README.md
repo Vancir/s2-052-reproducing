@@ -279,14 +279,6 @@ Apache Struts 2漏洞频发，过往有大量的该产品的漏洞预警。安�
 * 升级至`Struts 2.5.13`或`Struts 2.3.34`版本
 * 在不使用时移除移除`Struts REST`插件
 
-
-## 0xEE 人员分工
-
-* 组长-陈洪杰：负责项目进度监督，任务调整以及漏洞的深入分析
-* 刘松：负责搭建漏洞复现环境，并对漏洞代码以及补丁进行分析
-* 林欣：负责收集过往Struts2的漏洞分析文章，利用代码及防御策略等
-* 李金航：负责收集s2-052漏洞的技术分析文章，利用代码及防御策略等
-
 ## 0xFF 参考资料
 1. [Using QL to find a remote code execution vulnerability in Apache Struts (CVE-2017-9805)](https://lgtm.com/blog/apache_struts_CVE-2017-9805)
 
